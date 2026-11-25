@@ -9,29 +9,41 @@ from playwright.sync_api import sync_playwright
 # ==============================================================================
 # КОНФИГУРАЦИЯ И СПИСОК ГОРОДОВ
 # ==============================================================================
+# Формат: "Название": ("поддомен", "точный_путь_города")
 LOCATIONS = {
-    "Новосибирск": 4897,
-    "Бердск": 4681,
-    "Кольцово": 175657,
-    "Краснообск": 175684,
-    "Омск": 4914,
-    "Калачинск": 4781,
-    "Екатеринбург": 4743,
-    "Верхняя Пышма": 4702,
-    "Березовский": 4682,
-    "Первоуральск": 4927,
-    "Санкт-Петербург": 2,
-    "Мурино": 175049,
-    "Кудрово": 175013,
-    "Всеволожск": 4712,
-    "Гатчина": 4718,
-    "Москва": 1,
-    "Люберцы": 4850,
-    "Химки": 5044,
-    "Красногорск": 4820,
-    "Троицк": 5019,
-    "Королёв": 4813
+    # 1. Новосибирский кластер
+    "Новосибирск": ("novosibirsk", ""),
+    "Бердск": ("novosibirsk", "novosibirskaya-oblast-berdsk"),
+    "Кольцово": ("novosibirsk", "novosibirskaya-oblast-kolcovo-01306058"),
+    "Краснообск": ("novosibirsk", "novosibirskaya-oblast-novosibirskiy-rayon-krasnoobsk-01332373"),
+
+    # 2. Омский кластер
+    "Омск": ("omsk", ""),
+    "Калачинск": ("omsk", "omskaya-oblast-kalachinsk"),
+
+    # 3. Екатеринбургский кластер
+    "Екатеринбург": ("ekb", ""),
+    "Верхняя Пышма": ("ekb", "sverdlovskaya-oblast-verhnyaya-pyshma"),
+    "Березовский": ("ekb", "sverdlovskaya-oblast-berezovskiy"),
+    "Первоуральск": ("ekb", "sverdlovskaya-oblast-pervouralsk"),
+
+    # 4. Санкт-Петербургский кластер
+    "Санкт-Петербург": ("spb", ""),
+    "Мурино": ("spb", "leningradskaya-oblast-vsevolozhskiy-rayon-murino-01100288"),
+    "Кудрово": ("spb", "leningradskaya-oblast-vsevolozhskiy-rayon-kudrovo-01100260"),
+    "Всеволожск": ("spb", "leningradskaya-oblast-vsevolozhsk"),
+    "Гатчина": ("spb", "leningradskaya-oblast-gatchina"),
+
+    # 5. Московский кластер
+    "Москва": ("www", ""),
+    "Люберцы": ("lyubertsy", "moskovskaya-oblast-lyubercy"),
+    "Химки": ("khimki", "moskovskaya-oblast-himki"),
+    "Красногорск": ("krasnogorsk", "moskovskaya-oblast-krasnogorsk"),
+    "Троицк": ("www", "moskva-troick"),
+    "Королёв": ("korolev", "moskovskaya-oblast-korolev")
 }
+
+
 
 # Комнатность: 1=1к, 2=2к, 3=3к, 9=студия
 ROOM_TYPES = [1, 2, 3, 9]
@@ -113,7 +125,7 @@ def extract_offers_from_page(page, current_date_str, city_name, deal, room):
             # Извлекаем адрес
             address_line = next((l for l in lines if city_name in l or 'ул.' in l or 'просп.' in l or 'р-н' in l or 'ш.' in l), "")
 
-            clean_url = f"https://cian.ru{'rent' if deal == 'rent_long' else 'sale'}/flat/{cian_id}/"
+            clean_url = f"https://cian.ru/{'rent' if deal == 'rent_long' else 'sale'}/flat/{cian_id}/"
 
             results.append({
                 "parsing_date": current_date_str,
@@ -166,23 +178,23 @@ def run_parsing():
         time.sleep(3)
 
         for deal in deal_types:
-            deal_param = "rent" if deal == "rent_long" else "sale"
-            type_param = "&type=4" if deal == "rent_long" else ""
+            # Формируем начало ЧПУ-ссылки ЦИАН: купить или снять квартиру
+            action_slug = "snyat-kvartiru" if deal == "rent_long" else "kupit-kvartiru"
 
-            for city_name, region_id in LOCATIONS.items():
+            for city_name, (subdomain, city_slug) in LOCATIONS.items():
                 print(f"\n📍 Город: {city_name} [{deal.upper()}]")
                 filename = f"{current_date_str}_{city_name.lower()}_{deal}.csv"
                 file_path = os.path.join(OUTPUT_DIR, filename)
 
                 for room in ROOM_TYPES:
-                    room_param = f"room{room}=1" if room != 9 else "room9=1"
+                    # В ЧПУ-ссылках ЦИАН комнатность задается параметром ?room1=1 и страницей &p=2
+                    room_q = f"room{room}=1" if room != 9 else "room9=1"
                     city_room_offers = []
 
                     for page_num in range(1, MAX_PAGES + 1):
-                        domain = "https://cian.ru"
-                        path = "/cat.php"
-                        params = f"?deal_type={deal_param}&engine_version=2&offer_type=flat&p={page_num}&region={region_id}&{room_param}{type_param}"
-                        url = domain + path + params
+                        suffix = f"-{city_slug}" if city_slug else ""
+                        base_url = f"https://{subdomain}.cian.ru/{action_slug}{suffix}/"
+                        url = f"{base_url}?{room_q}&p={page_num}"
 
                         try:
                             page.goto(url, wait_until="domcontentloaded",
