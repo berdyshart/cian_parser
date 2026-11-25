@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import time
 import random
 from datetime import datetime
@@ -35,9 +34,9 @@ LOCATIONS = {
 }
 
 # Комнатность: 1=1к, 2=2к, 3=3к, 9=студия
-ROOM_TYPES =[1, 2, 3, 9]
+ROOM_TYPES = [1, 2, 3, 9]
 
-# Количество страниц на категорию (1 стр. = 28 объявлений)
+# Количество страниц на категорию (1 стр. = ~28 объявлений)
 MAX_PAGES = 5
 
 OUTPUT_DIR = "cian_data_raw"
@@ -45,25 +44,95 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 # ==============================================================================
-# ФУНКЦИЯ ИЗВЛЕЧЕНИЯ ДАННЫХ ИЗ КОДА СТРАНИЦЫ
+# ФУНКЦИЯ ИЗВЛЕЧЕНИЯ ДАННЫХ ПРЯМО С ЭКРАНА БРАУЗЕРА
 # ==============================================================================
-def extract_offers_from_html(html_content):
-    # ЦИАН хранит все данные выдачи в скрытом JSON внутри тега script
-    match = re.search(
-        r"window\._cianConfig\['frontend-serp'\]\s*=\s*(\[.*?\]);",
-        html_content, re.DOTALL)
-    if not match:
+def extract_offers_from_page(page, current_date_str, city_name, deal, room):
+    try:
+        page.wait_for_selector('a[href*="/rent/flat/"], a[href*="/sale/flat/"]', timeout=10000)
+    except Exception:
         return []
 
-    try:
-        config_data = json.loads(match.group(1))
-        for item in config_data:
-            if item.get("key") == "initialState":
-                return item.get("value", {}).get("results", {}).get("offers",
-                                                                    [])
-    except Exception:
-        pass
-    return []
+    links = page.locator('a[href*="/rent/flat/"], a[href*="/sale/flat/"]').all()
+    seen_ids = set()
+    results = []
+
+    for link in links:
+        try:
+            url = link.get_attribute("href")
+            if not url:
+                continue
+
+            # Ищем ID квартиры в ссылке (работает даже если в конце ссылки есть ?utm=...)
+            id_match = re.search(r'/(?:rent|sale)/flat/(\d+)', url)
+            if not id_match:
+                continue
+
+            cian_id = id_match.group(1)
+            if cian_id in seen_ids:
+                continue
+
+            # Поднимаемся вверх по дереву элементов до карточки, содержащей цену (₽) и площадь (м²)
+            card = link
+            card_text = ""
+            for _ in range(8):
+                parent = card.locator("..")
+                if parent.count() == 0:
+                    break
+                text = parent.inner_text()
+                if '₽' in text and 'м²' in text:
+                    card_text = text
+                    break
+                card = parent
+
+            if not card_text:
+                continue
+
+            seen_ids.add(cian_id)
+            lines = [line.strip() for line in card_text.split('\n') if line.strip()]
+
+            # Извлекаем цену в рублях
+            price = None
+            for l in lines:
+                if '₽' in l and ('/мес' in l or 'млн' in l or 'тыс' in l or re.search(r'\d\s*₽', l)):
+                    price_match = re.search(r'([\d\s]+)\s*₽', l)
+                    if price_match:
+                        digits = re.sub(r'\D', '', price_match.group(1))
+                        if digits:
+                            price = int(digits)
+                            break
+
+            # Извлекаем площадь и этаж
+            title_line = next((l for l in lines if 'м²' in l), "")
+            area_match = re.search(r'([\d,]+)\s*м²', title_line)
+            total_area = float(area_match.group(1).replace(',', '.')) if area_match else None
+
+            floor_match = re.search(r'(\d+)/(\d+)\s*этаж', title_line)
+            floor = int(floor_match.group(1)) if floor_match else None
+            floors_count = int(floor_match.group(2)) if floor_match else None
+
+            # Извлекаем адрес
+            address_line = next((l for l in lines if city_name in l or 'ул.' in l or 'просп.' in l or 'р-н' in l or 'ш.' in l), "")
+
+            clean_url = f"https://cian.ru{'rent' if deal == 'rent_long' else 'sale'}/flat/{cian_id}/"
+
+            results.append({
+                "parsing_date": current_date_str,
+                "city": city_name,
+                "deal_type": deal,
+                "cian_id": cian_id,
+                "price": price,
+                "rooms": room if room != 9 else 0,
+                "total_area": total_area,
+                "floor": floor,
+                "floors_count": floors_count,
+                "address": address_line,
+                "url": clean_url
+            })
+        except Exception:
+            continue
+
+    return results
+
 
 
 # ==============================================================================
@@ -82,16 +151,15 @@ def run_parsing():
         print(f"📅 Обычный день ({current_date_str}). Собираем только АРЕНДУ.")
 
     with sync_playwright() as p:
-        # Запускаем настоящий Chrome в фоновом режиме (headless=True)
-        # Если захотите увидеть, как он сам кликает страницы — поменяйте на headless=False
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080}
+            viewport={"width": 1366, "height": 768}
         )
         page = context.new_page()
 
-        # Первый прогревочный заход на главную страницу для получения кук
         print("🌐 Инициализация браузера и получение кук ЦИАН...")
         page.goto("https://cian.ru", wait_until="domcontentloaded",
                   timeout=30000)
@@ -99,7 +167,7 @@ def run_parsing():
 
         for deal in deal_types:
             deal_param = "rent" if deal == "rent_long" else "sale"
-            type_param = "&type=4" if deal == "rent_long" else ""  # type=4 = длительная аренда
+            type_param = "&type=4" if deal == "rent_long" else ""
 
             for city_name, region_id in LOCATIONS.items():
                 print(f"\n📍 Город: {city_name} [{deal.upper()}]")
@@ -111,70 +179,44 @@ def run_parsing():
                     city_room_offers = []
 
                     for page_num in range(1, MAX_PAGES + 1):
-                        url = f"https://cian.rucat.php?deal_type={deal_param}&engine_version=2&offer_type=flat&p={page_num}&region={region_id}&{room_param}{type_param}"
+                        domain = "https://cian.ru"
+                        path = "/cat.php"
+                        params = f"?deal_type={deal_param}&engine_version=2&offer_type=flat&p={page_num}&region={region_id}&{room_param}{type_param}"
+                        url = domain + path + params
 
                         try:
                             page.goto(url, wait_until="domcontentloaded",
                                       timeout=25000)
-                            # Небольшая пауза для прогрузки скриптов страницы
-                            time.sleep(random.uniform(1.5, 3.0))
-
-                            html = page.content()
-                            offers = extract_offers_from_html(html)
+                            offers = extract_offers_from_page(page,
+                                                              current_date_str,
+                                                              city_name, deal,
+                                                              room)
 
                             if not offers:
-                                # Проверяем, не вылезла ли капча
-                                if "captcha" in html.lower() or "робот" in html.lower():
+                                if page.locator(
+                                        'form[action*="captcha"], #captcha').count() > 0:
                                     print(
-                                        "  ⚠️ Поймали капчу! Делаем паузу 15 секунд...")
-                                    time.sleep(15)
-                                break
+                                        "  ⚠️ Реальная капча! Решите её в браузере (ждем 25 сек)...")
+                                    time.sleep(25)
+                                    offers = extract_offers_from_page(page,
+                                                                      current_date_str,
+                                                                      city_name,
+                                                                      deal,
+                                                                      room)
 
-                            for offer in offers:
-                                bargain = offer.get("bargainTerms", {})
-                                building = offer.get("building", {})
-                                geo = offer.get("geo", {})
-                                undergrounds = geo.get("undergrounds", [])
+                                if not offers:
+                                    break
 
-                                parsed_item = {
-                                    "parsing_date": current_date_str,
-                                    "city": city_name,
-                                    "deal_type": deal,
-                                    "cian_id": offer.get("cianId"),
-                                    "price": bargain.get("priceRur"),
-                                    "rooms": offer.get(
-                                        "roomsCount") if room != 9 else 0,
-                                    "total_area": offer.get("totalArea"),
-                                    "living_area": offer.get("livingArea"),
-                                    "kitchen_area": offer.get("kitchenArea"),
-                                    "floor": offer.get("floorNumber"),
-                                    "floors_count": building.get(
-                                        "floorsCount"),
-                                    "build_year": building.get("buildYear"),
-                                    "material_type": building.get(
-                                        "materialType"),
-                                    "address": geo.get("userInput"),
-                                    "lat": geo.get("coordinates", {}).get(
-                                        "lat"),
-                                    "lng": geo.get("coordinates", {}).get(
-                                        "lng"),
-                                    "metro": undergrounds.get(
-                                        "name") if undergrounds else None,
-                                    "metro_minutes": undergrounds.get(
-                                        "time") if undergrounds else None,
-                                    "url": offer.get("fullUrl")
-                                }
-                                city_room_offers.append(parsed_item)
-
+                            city_room_offers.extend(offers)
                             print(
                                 f"  ↳ Комнат: {room} | Стр. {page_num}: собрано {len(offers)} шт.")
+                            time.sleep(random.uniform(1.0, 2.0))
 
                         except Exception as e:
                             print(
                                 f"  ❌ Ошибка загрузки (комн. {room}, стр. {page_num}): {e}")
                             break
 
-                    # Мгновенная запись в CSV после каждой категории комнат
                     if city_room_offers:
                         df = pd.DataFrame(city_room_offers)
                         header = not os.path.exists(file_path)
