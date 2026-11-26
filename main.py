@@ -7,34 +7,27 @@ import pandas as pd
 from playwright.sync_api import sync_playwright
 
 # ==============================================================================
-# КОНФИГУРАЦИЯ И СПИСОК ГОРОДОВ
+# КОНФИГУРАЦИЯ И ТОЧНАЯ СЕТКА ГОРОДОВ
 # ==============================================================================
-# Формат: "Название": ("поддомен", "точный_путь_города")
 LOCATIONS = {
-    # 1. Новосибирский кластер
     "Новосибирск": ("novosibirsk", ""),
     "Бердск": ("novosibirsk", "novosibirskaya-oblast-berdsk"),
     "Кольцово": ("novosibirsk", "novosibirskaya-oblast-kolcovo-01306058"),
-    "Краснообск": ("novosibirsk", "novosibirskaya-oblast-novosibirskiy-rayon-krasnoobsk-01332373"),
-
-    # 2. Омский кластер
+    "Краснообск": ("novosibirsk",
+                   "novosibirskaya-oblast-novosibirskiy-rayon-krasnoobsk-01332373"),
     "Омск": ("omsk", ""),
     "Калачинск": ("omsk", "omskaya-oblast-kalachinsk"),
-
-    # 3. Екатеринбургский кластер
     "Екатеринбург": ("ekb", ""),
     "Верхняя Пышма": ("ekb", "sverdlovskaya-oblast-verhnyaya-pyshma"),
     "Березовский": ("ekb", "sverdlovskaya-oblast-berezovskiy"),
     "Первоуральск": ("ekb", "sverdlovskaya-oblast-pervouralsk"),
-
-    # 4. Санкт-Петербургский кластер
     "Санкт-Петербург": ("spb", ""),
-    "Мурино": ("spb", "leningradskaya-oblast-vsevolozhskiy-rayon-murino-01100288"),
-    "Кудрово": ("spb", "leningradskaya-oblast-vsevolozhskiy-rayon-kudrovo-01100260"),
+    "Мурино": ("spb",
+               "leningradskaya-oblast-vsevolozhskiy-rayon-murino-01100288"),
+    "Кудрово": ("spb",
+                "leningradskaya-oblast-vsevolozhskiy-rayon-kudrovo-01100260"),
     "Всеволожск": ("spb", "leningradskaya-oblast-vsevolozhsk"),
     "Гатчина": ("spb", "leningradskaya-oblast-gatchina"),
-
-    # 5. Московский кластер
     "Москва": ("www", ""),
     "Люберцы": ("lyubertsy", "moskovskaya-oblast-lyubercy"),
     "Химки": ("khimki", "moskovskaya-oblast-himki"),
@@ -43,29 +36,26 @@ LOCATIONS = {
     "Королёв": ("korolev", "moskovskaya-oblast-korolev")
 }
 
-
-
-# Комнатность: 1=1к, 2=2к, 3=3к, 9=студия
-ROOM_TYPES = [1, 2, 3, 9]
-
-# Количество страниц на категорию (1 стр. = ~28 объявлений)
-MAX_PAGES = 5
+# Глубина сбора (30 страниц = до ~840 уникальных квартир на город)
+MAX_PAGES = 30
 
 OUTPUT_DIR = "cian_data_raw"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 # ==============================================================================
-# ФУНКЦИЯ ИЗВЛЕЧЕНИЯ ДАННЫХ ПРЯМО С ЭКРАНА БРАУЗЕРА
+# ФУНКЦИЯ ИЗВЛЕЧЕНИЯ ДАННЫХ С ЭКРАНА (С РЕАЛЬНЫМИ КОМНАТАМИ И РАБОЧЕЙ ССЫЛКОЙ)
 # ==============================================================================
-def extract_offers_from_page(page, current_date_str, city_name, deal, room):
+def extract_offers_from_page(page, current_date_str, city_name, deal,
+                             global_seen_ids):
     try:
-        page.wait_for_selector('a[href*="/rent/flat/"], a[href*="/sale/flat/"]', timeout=10000)
+        page.wait_for_selector(
+            'a[href*="/rent/flat/"], a[href*="/sale/flat/"]', timeout=10000)
     except Exception:
         return []
 
-    links = page.locator('a[href*="/rent/flat/"], a[href*="/sale/flat/"]').all()
-    seen_ids = set()
+    links = page.locator(
+        'a[href*="/rent/flat/"], a[href*="/sale/flat/"]').all()
     results = []
 
     for link in links:
@@ -74,16 +64,15 @@ def extract_offers_from_page(page, current_date_str, city_name, deal, room):
             if not url:
                 continue
 
-            # Ищем ID квартиры в ссылке (работает даже если в конце ссылки есть ?utm=...)
             id_match = re.search(r'/(?:rent|sale)/flat/(\d+)', url)
             if not id_match:
                 continue
 
             cian_id = id_match.group(1)
-            if cian_id in seen_ids:
+            # Отсекаем дубликаты (включая рекламные ТОП-объявления, повторяющиеся на страницах)
+            if cian_id in global_seen_ids:
                 continue
 
-            # Поднимаемся вверх по дереву элементов до карточки, содержащей цену (₽) и площадь (м²)
             card = link
             card_text = ""
             for _ in range(8):
@@ -99,13 +88,16 @@ def extract_offers_from_page(page, current_date_str, city_name, deal, room):
             if not card_text:
                 continue
 
-            seen_ids.add(cian_id)
-            lines = [line.strip() for line in card_text.split('\n') if line.strip()]
+            global_seen_ids.add(cian_id)
+            lines = [line.strip() for line in card_text.split('\n') if
+                     line.strip()]
 
-            # Извлекаем цену в рублях
+            # 1. Цена
             price = None
             for l in lines:
-                if '₽' in l and ('/мес' in l or 'млн' in l or 'тыс' in l or re.search(r'\d\s*₽', l)):
+                if '₽' in l and (
+                        '/мес' in l or 'млн' in l or 'тыс' in l or re.search(
+                        r'\d\s*₽', l)):
                     price_match = re.search(r'([\d\s]+)\s*₽', l)
                     if price_match:
                         digits = re.sub(r'\D', '', price_match.group(1))
@@ -113,19 +105,35 @@ def extract_offers_from_page(page, current_date_str, city_name, deal, room):
                             price = int(digits)
                             break
 
-            # Извлекаем площадь и этаж
+            # 2. Заголовок: извлекаем реальное кол-во комнат, площадь и этаж
             title_line = next((l for l in lines if 'м²' in l), "")
+
+            rooms = None
+            if 'студия' in title_line.lower():
+                rooms = 0
+            else:
+                room_match = re.search(r'(\d+)-комн', title_line.lower())
+                if room_match:
+                    rooms = int(room_match.group(1))
+
             area_match = re.search(r'([\d,]+)\s*м²', title_line)
-            total_area = float(area_match.group(1).replace(',', '.')) if area_match else None
+            total_area = float(
+                area_match.group(1).replace(',', '.')) if area_match else None
 
             floor_match = re.search(r'(\d+)/(\d+)\s*этаж', title_line)
             floor = int(floor_match.group(1)) if floor_match else None
             floors_count = int(floor_match.group(2)) if floor_match else None
 
-            # Извлекаем адрес
-            address_line = next((l for l in lines if city_name in l or 'ул.' in l or 'просп.' in l or 'р-н' in l or 'ш.' in l), "")
+            # 3. Адрес
+            address_line = next((l for l in lines if
+                                 city_name in l or 'ул.' in l or 'просп.' in l or 'р-н' in l or 'ш.' in l),
+                                "")
 
-            clean_url = f"https://cian.ru/{'rent' if deal == 'rent_long' else 'sale'}/flat/{cian_id}/"
+            # 4. Гарантированно правильная ссылка со слэшем
+            deal_part = "rent" if deal == "rent_long" else "sale"
+            clean_url = "/".join(
+                ["https:/", "www.cian.ru", deal_part, "flat", str(cian_id),
+                 ""])
 
             results.append({
                 "parsing_date": current_date_str,
@@ -133,7 +141,7 @@ def extract_offers_from_page(page, current_date_str, city_name, deal, room):
                 "deal_type": deal,
                 "cian_id": cian_id,
                 "price": price,
-                "rooms": room if room != 9 else 0,
+                "rooms": rooms,
                 "total_area": total_area,
                 "floor": floor,
                 "floors_count": floors_count,
@@ -146,9 +154,8 @@ def extract_offers_from_page(page, current_date_str, city_name, deal, room):
     return results
 
 
-
 # ==============================================================================
-# ОСНОВНОЙ ЦИКЛ СБОРА ЧЕРЕЗ БРАУЗЕР
+# ОСНОВНОЙ ЦИКЛ СБОРА
 # ==============================================================================
 def run_parsing():
     current_date_str = datetime.now().strftime("%Y-%m-%d")
@@ -167,18 +174,15 @@ def run_parsing():
             headless=False,
             args=["--disable-blink-features=AutomationControlled"]
         )
-        context = browser.new_context(
-            viewport={"width": 1366, "height": 768}
-        )
+        context = browser.new_context(viewport={"width": 1366, "height": 768})
         page = context.new_page()
 
-        print("🌐 Инициализация браузера и получение кук ЦИАН...")
+        print("🌐 Инициализация браузера и прогрев сессии...")
         page.goto("https://cian.ru", wait_until="domcontentloaded",
                   timeout=30000)
         time.sleep(3)
 
         for deal in deal_types:
-            # Формируем начало ЧПУ-ссылки ЦИАН: купить или снять квартиру
             action_slug = "snyat-kvartiru" if deal == "rent_long" else "kupit-kvartiru"
 
             for city_name, (subdomain, city_slug) in LOCATIONS.items():
@@ -186,61 +190,81 @@ def run_parsing():
                 filename = f"{current_date_str}_{city_name.lower()}_{deal}.csv"
                 file_path = os.path.join(OUTPUT_DIR, filename)
 
-                for room in ROOM_TYPES:
-                    # В ЧПУ-ссылках ЦИАН комнатность задается параметром ?room1=1 и страницей &p=2
-                    room_q = f"room{room}=1" if room != 9 else "room9=1"
-                    city_room_offers = []
+                suffix = f"-{city_slug}" if city_slug else ""
+                start_url = f"https://{subdomain}.cian.ru/{action_slug}{suffix}/"
 
-                    for page_num in range(1, MAX_PAGES + 1):
-                        suffix = f"-{city_slug}" if city_slug else ""
-                        base_url = f"https://{subdomain}.cian.ru/{action_slug}{suffix}/"
-                        url = f"{base_url}?{room_q}&p={page_num}"
+                try:
+                    page.goto(start_url, wait_until="domcontentloaded",
+                              timeout=25000)
+                except Exception as e:
+                    print(f"  ❌ Ошибка открытия {start_url}: {e}")
+                    continue
 
-                        try:
-                            page.goto(url, wait_until="domcontentloaded",
-                                      timeout=25000)
+                # Множество для контроля уникальности ID внутри всего города
+                global_seen_ids = set()
+                city_offers = []
+
+                for page_num in range(1, MAX_PAGES + 1):
+                    offers = extract_offers_from_page(page, current_date_str,
+                                                      city_name, deal,
+                                                      global_seen_ids)
+
+                    if not offers and page_num == 1:
+                        if page.locator(
+                                'form[action*="captcha"], #captcha').count() > 0:
+                            print(
+                                "  ⚠️ Капча! Решите её в браузере (ждем 25 сек)...")
+                            time.sleep(25)
                             offers = extract_offers_from_page(page,
                                                               current_date_str,
                                                               city_name, deal,
-                                                              room)
+                                                              global_seen_ids)
 
-                            if not offers:
-                                if page.locator(
-                                        'form[action*="captcha"], #captcha').count() > 0:
-                                    print(
-                                        "  ⚠️ Реальная капча! Решите её в браузере (ждем 25 сек)...")
-                                    time.sleep(25)
-                                    offers = extract_offers_from_page(page,
-                                                                      current_date_str,
-                                                                      city_name,
-                                                                      deal,
-                                                                      room)
+                    if offers:
+                        city_offers.extend(offers)
+                        print(
+                            f"  ↳ Стр. {page_num}: +{len(offers)} уникальных шт. (Всего по городу: {len(city_offers)})")
+                    else:
+                        print(f"  ↳ Стр. {page_num}: новых объявлений нет.")
 
-                                if not offers:
+                    # Ищем кнопку перехода на следующую страницу ("Дальше" или номер страницы)
+                    next_btn = page.locator(
+                        'a:has-text("Дальше"), a[href*="p=' + str(
+                            page_num + 1) + '"]').first
+                    if next_btn.count() > 0 and page_num < MAX_PAGES:
+                        try:
+                            # Запоминаем текст первой ссылки до клика
+                            first_href_before = page.locator(
+                                'a[href*="/rent/flat/"], a[href*="/sale/flat/"]').first.get_attribute(
+                                "href")
+
+                            next_btn.scroll_into_view_if_needed()
+                            time.sleep(random.uniform(1.0, 1.5))
+                            next_btn.click()
+
+                            # Ждем до 8 секунд, пока список квартир на экране реально не обновится
+                            for _ in range(16):
+                                time.sleep(0.5)
+                                current_first_href = page.locator(
+                                    'a[href*="/rent/flat/"], a[href*="/sale/flat/"]').first.get_attribute(
+                                    "href")
+                                if current_first_href != first_href_before:
                                     break
-
-                            city_room_offers.extend(offers)
-                            print(
-                                f"  ↳ Комнат: {room} | Стр. {page_num}: собрано {len(offers)} шт.")
-                            time.sleep(random.uniform(1.0, 2.0))
-
-                        except Exception as e:
-                            print(
-                                f"  ❌ Ошибка загрузки (комн. {room}, стр. {page_num}): {e}")
+                        except Exception:
                             break
+                    else:
+                        break
 
-                    if city_room_offers:
-                        df = pd.DataFrame(city_room_offers)
-                        header = not os.path.exists(file_path)
-                        df.to_csv(file_path, mode='a', header=header,
-                                  index=False, encoding="utf-8-sig")
+                if city_offers:
+                    df = pd.DataFrame(city_offers)
+                    df.to_csv(file_path, index=False, encoding="utf-8-sig")
+                    print(
+                        f"💾 Город {city_name} сохранен: {len(city_offers)} уникальных квартир в {filename}")
 
-                if os.path.exists(file_path):
-                    print(f"💾 Файл успешно обновлен: {filename}")
                 time.sleep(random.uniform(2.0, 4.0))
 
         browser.close()
-    print("\n🎉 Сбор данных полностью завершен!")
+    print("\n🎉 Сбор базовых списков полностью завершен!")
 
 
 if __name__ == "__main__":
